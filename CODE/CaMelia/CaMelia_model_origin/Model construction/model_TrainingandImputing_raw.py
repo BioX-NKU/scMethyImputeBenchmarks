@@ -1,0 +1,246 @@
+from __future__ import division
+from sys import argv
+import pandas as pd
+import numpy as np
+import os
+import time
+
+import matplotlib as mpl
+mpl.use('Agg')
+import matplotlib.pyplot as plt
+
+from numba import jit
+from sklearn import metrics
+import catboost as cb
+import warnings
+warnings.filterwarnings('ignore')
+
+
+##################################
+def reduce_mem(df):
+    starttime = time.time()
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2
+    for col in df.columns:
+        col_type = df[col].dtypes
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if pd.isnull(c_min) or pd.isnull(c_max):
+                continue
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                    df[col] = df[col].astype(np.float16)
+                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    print('-- Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction),time spend:{:2.2f} min'.format(end_mem,
+                                                                           100*(start_mem - end_mem)/start_mem,
+                                                                           (time.time() - starttime)/60))
+    return df
+
+
+##################################
+@jit
+def auc(m, train, test):
+    return (metrics.roc_auc_score(train[1], m.predict_proba(train[0])[:, 1]),
+            metrics.roc_auc_score(test[1], m.predict_proba(test[0])[:, 1]))
+
+
+@jit
+def acc(m, train, test):
+    a = m.predict_proba(train[0])[:, 1]
+    a = np.int64(a >= 0.5)
+    b = m.predict_proba(test[0])[:, 1]
+    b = np.int64(b >= 0.5)
+    return (metrics.accuracy_score(train[1], a), metrics.accuracy_score(test[1], b))
+
+
+@jit
+def spsemcc(m, X_train, y_true):
+    TP = 0
+    FP = 0
+    FN = 0
+    TN = 0
+    y_pre = m.predict_proba(X_train)[:, 1]
+    y_pre = np.int64(y_pre > 0.5)
+    for j in range(len(y_true)):
+        if y_true[j] == 1:
+            if y_pre[j] == 1:
+                TP += 1
+            else:
+                FN += 1
+        if y_true[j] == 0:
+            if y_pre[j] == 0:
+                TN += 1
+            else:
+                FP += 1
+    sp = (1 - FP / (TN + FP))
+    se = TP / (TP + FN)
+    mcc = (TP * TN - FP * FN) / (((TN + FN) * (TN + FP) * (TP + FN) * (TP + FP)) ** 0.5)
+    return 'sp: ', sp, 'se: ', se, 'mcc: ', mcc
+
+
+################################################
+from sklearn.metrics import f1_score
+
+
+@jit
+def f1(m, train, test):
+    a = m.predict_proba(train[0])[:, 1]
+    a = np.int64(a >= 0.5)
+    b = m.predict_proba(test[0])[:, 1]
+    b = np.int64(b >= 0.5)
+    return (f1_score(train[1], a), f1_score(test[1], b))
+
+
+if __name__ == '__main__':
+    # All data located in the same directory
+    DataPath = r'%s' % argv[1]
+    # Input data
+    InputDataName = '%s' % argv[2]
+    # task type: 'GPU' or 'CPU'
+    t_t = '%s' % argv[3]
+
+
+    gse = DataPath
+    # gse = r'/home/tjx/SinglecellData/test_MPP_0702'
+
+    meragefiledir_out = r'%s/Available_Train_dataset/region10' % gse
+    filenames_out = os.listdir(meragefiledir_out)
+
+    meragefiledir_impu = r'%s/Available_Imputation_dataset/region10' % gse
+    filenames_impu = os.listdir(meragefiledir_impu)
+
+
+    file_dir_png = r'%s/model_feature_importance' % gse
+    if not os.path.exists(file_dir_png):
+        os.makedirs(file_dir_png)
+
+    file_dir_pre = r'%s/imputation_data' % gse
+    if not os.path.exists(file_dir_pre):
+        os.makedirs(file_dir_pre)
+
+    file_dir_model = r'%s/model_save' % gse
+    if not os.path.exists(file_dir_model):
+        os.makedirs(file_dir_model)
+
+    ACC = []
+    AUC = []
+    SP = []
+    SE = []
+    MCC = []
+    F1 = []
+
+
+    for i in range(len(filenames_out)):
+        # Train data
+        path = r'%s/%s' % (meragefiledir_out, filenames_out[i])
+        print(path)
+        dataset_train = pd.read_csv(path, header=0, sep='\t')
+        dataset_train = reduce_mem(dataset_train)
+        dataset_train = dataset_train.dropna(axis=1, how='all')
+        dataset_train = dataset_train.dropna(axis=0, how='any')
+
+        # Imputation data
+        path = r'%s/%s' % (meragefiledir_impu, filenames_out[i])
+        print(path)
+        dataset_impu = pd.read_csv(path, header=0, sep='\t')
+        dataset_impu = reduce_mem(dataset_impu)
+        dataset_impu = dataset_impu.dropna(axis=1, how='all')
+        dataset_impu = dataset_impu.dropna(axis=0, how='any')
+
+        val_chromosomes = ['chr1', 'chr3', 'chr6', 'chr7', 'chr9']
+        test_chromosomes = ['chr2', 'chr4', 'chr5', 'chr8', 'chr10', 'chr12']
+        val_data = dataset_train[dataset_train['chrom'].isin(val_chromosomes)]
+        test_data = dataset_train[dataset_train['chrom'].isin(test_chromosomes)]
+        train_data = dataset_train[~dataset_train['chrom'].isin(val_chromosomes + test_chromosomes)]
+
+        val_data_ = val_data.values
+        test_data_ = test_data.values
+        train_data_ = train_data.values
+
+        X_train = train_data_[:, 3:]
+        y_train = train_data_[:, 2]
+        y_train = np.int64(y_train >= 0.5)
+        X_val = val_data_[:, 3:]
+        y_val = val_data_[:, 2]
+        y_val = np.int64(y_val >= 0.5)
+        X_test = test_data_[:, 3:]
+        y_test = test_data_[:, 2]
+        y_test = np.int64(y_test >= 0.5)
+
+
+        model = cb.CatBoostClassifier(random_state=514, learning_rate=0.1, max_depth=7, verbose=1000, eval_metric='AUC', task_type=t_t)
+        model.fit(X_train, y_train, eval_set=(X_val, y_val))
+
+
+        train_acc, test_acc = acc(model, (X_train, y_train), (X_test, y_test))
+        train_auc, test_auc = auc(model, (X_train, y_train), (X_test, y_test))
+        train_f1, test_f1 = f1(model, (X_train, y_train), (X_test, y_test))
+        spsemcc_result = spsemcc(model, X_test, y_test)
+
+
+        ACC.append(round(test_acc, 4))
+        AUC.append(round(test_auc, 4))
+        F1.append(round(test_f1, 4))
+        SP.append(round(spsemcc_result[1], 4))
+        SE.append(round(spsemcc_result[3], 4))
+        MCC.append(round(spsemcc_result[5], 4))
+
+
+        # all data fit
+        model = cb.CatBoostClassifier(learning_rate=0.1, max_depth=7, verbose=1000, eval_metric='AUC', task_type=t_t)
+        X = dataset_train.values[:, 3:]
+        Y = dataset_train.values[:, 2]
+        Y = np.int64(Y >= 0.5)
+        model.fit(X, Y)
+        # save model
+        model.save_model(r'%s/%s.model' % (file_dir_model, filenames_out[i].split('.')[0]))
+        print('%s: training Done!' % filenames_out[i].split('.')[0])
+        print('----------------')
+        print('%s: imputation start!' % filenames_out[i].split('.')[0])
+        # pre
+        prediction = model.predict_proba(dataset_impu.values[:, 2:])[:, 1]
+        pre = []
+        for m in range(len(prediction)):
+            if prediction[m] >= 0.6:
+                pre.append(1)
+            elif prediction[m] <= 0.4:
+                pre.append(0)
+            else:
+                pre.append(np.nan)
+
+        data_pre = pd.DataFrame(np.random.randn(0, 3), columns=['chrom', 'location', 'pre_meth'])
+        data_pre['chrom'] = dataset_impu.values[:, 0]
+        data_pre['location'] = dataset_impu.values[:, 1]
+        data_pre['pre_meth'] = pre
+        # save
+        data_pre.to_csv(r'%s/%s.txt' % (file_dir_pre, filenames_out[i].split('.')[0]), sep='\t', header=True, index=False)
+        print('%s: imputation Done!' % filenames_out[i].split('.')[0])
+
+
+    cell = []
+    for i in range(len(filenames_out)):
+        cell.append(filenames_out[i].split('.')[0])
+
+    data = pd.DataFrame(np.random.randn(0, 7), columns=['cell', 'SP', 'SE', 'ACC', 'AUC', 'MCC', 'F1'])
+    data['cell'] = cell
+    data['SP'] = SP
+    data['SE'] = SE
+    data['ACC'] = ACC
+    data['AUC'] = AUC
+    data['MCC'] = MCC
+    data['F1'] = F1
+    data.to_csv(r'%s/catboost.csv' % gse, sep=',', header=True, index=False)
